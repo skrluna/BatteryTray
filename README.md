@@ -130,4 +130,4 @@ A：图形界面用系统自带 .NET Framework 4.8，不打包运行时；纯 Wi
 
 ## License
 
-[MIT](LICENSE) © neko
+[MIT](LICENSE) © skrluna
