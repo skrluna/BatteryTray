@@ -12,3 +12,4 @@ debug/
 *.jsonl
 swap_status.txt
 rebuild.done
+scan_report.txt
