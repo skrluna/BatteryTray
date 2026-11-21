@@ -6,6 +6,8 @@
 
 平台：Windows 10 / 11 (x64) ｜ 体积：~45 KB ｜ 依赖：无 ｜ 协议：MIT
 
+⬇️ **下载安装包**：[Releases](https://github.com/skrluna/BatteryTray/releases/latest) — `BatteryTraySetup.exe`（61 KB，双击安装）
+
 ![图标与电量状态预览](assets/icon_preview.png)
 
 ## 特性
