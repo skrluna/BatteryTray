@@ -15,7 +15,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("BatteryTray")]
-[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.1.0")]
 
 class BatteryTray
 {
@@ -792,7 +792,7 @@ class BatteryTray
             lock (gate) { rs = new List<Reading>(state.Values); }
             // 图标: 取最低电量(新鲜优先); 充电画黄边; 全部休眠灰色
             Reading lowest = null; bool anyFresh = false;
-            foreach (var r in rs) if (r.Fresh) { anyFresh = true; if (lowest == null || r.Pct < lowest.Pct) lowest = r; }
+            foreach (var r in rs) if (r.Fresh) { anyFresh = true; if (lowest == null || r.Pct < lowest.Pct || (r.Pct == lowest.Pct && lowest.Charging != 1 && r.Charging == 1)) lowest = r; }   // 并列时优先显示充电中的
             if (lowest == null) foreach (var r in rs) if (lowest == null || r.Pct < lowest.Pct) lowest = r;
             bool stale = !anyFresh;
             int pct = lowest != null ? lowest.Pct : -1;
@@ -807,6 +807,7 @@ class BatteryTray
             {
                 if (sb.Length > 0) sb.Append(" ");
                 sb.Append(r.Short).Append(":").Append(r.Pct).Append("%");
+                if (r.Charging == 1) sb.Append("(充电中)");
                 if (!r.Fresh) sb.Append("(休眠)");
             }
             string tip = sb.Length > 0 ? sb.ToString() : "未发现外设";
@@ -931,7 +932,7 @@ class BatteryTray
                     if (w < 4) w = 4;
                     using (var fb = new SolidBrush(ink)) g.FillRectangle(fb, 8, 18, w, 12);
                 }
-                if (charging && !stale)
+                if (charging)   // 休眠(灰)但充电中仍画闪电
                 {
                     Point[] bolt = new Point[] {
                         new Point(25, 15), new Point(17, 26), new Point(22, 26),
@@ -1003,7 +1004,7 @@ class BatteryTray
             foreach (var r in rs)
             {
                 Color c = !r.Fresh ? Color.FromArgb(140, 140, 140) : r.Pct <= 20 ? Color.FromArgb(255, 90, 90) : r.Pct <= 50 ? Color.FromArgb(255, 190, 60) : Color.FromArgb(90, 220, 120);
-                string status = r.Fresh ? (r.Charging == 1 ? "充电中" : "电量正常") : "休眠中 (显示上次电量)";
+                string status = r.Fresh ? (r.Charging == 1 ? "充电中" : "电量正常") : ("休眠中 (显示上次电量)" + (r.Charging == 1 ? " · 充电中" : ""));
                 int rowY = y;   // 供✎按钮定位重命名框
                 Controls.Add(new Label { Text = r.Name, Location = new Point(14, y), AutoSize = true, MaximumSize = new Size(200, 0) });
                 Controls.Add(new Label { Text = r.Pct + "%", Location = new Point(224, y - 2), AutoSize = true, ForeColor = c, Font = new Font("Segoe UI", 10f, FontStyle.Bold) });
@@ -1261,7 +1262,7 @@ class BatteryTray
         var mutex = new Mutex(true, "BatteryTray_SingleInstance_MchoseAtk", out created);
         if (!created) { MessageBox.Show("BatteryTray 已在运行中。", "外设电量", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
         Log.Init();
-        Log.W("启动 v1.3 (管理员, pid=" + System.Diagnostics.Process.GetCurrentProcess().Id + ")");
+        Log.W("启动 v1.3.1 (管理员, pid=" + System.Diagnostics.Process.GetCurrentProcess().Id + ")");
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new TrayApp());
