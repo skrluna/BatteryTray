@@ -15,7 +15,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("BatteryTray")]
-[assembly: System.Reflection.AssemblyVersion("1.1.0.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
 
 class BatteryTray
 {
@@ -370,6 +370,7 @@ class BatteryTray
     {
         if (vid == 0x3837 && pid == 0x1001) return "K7";
         if (vid == 0x41E4 && pid == 0x2004) return "接收器";
+        if (vid == 0x41E4 && pid == 0x2203) return "G98";
         if (vid == 0x373B) return "ATK";
         if (vid == 0x3554) return "VXE";
         string m = ModelName(vid, pid);
@@ -381,6 +382,7 @@ class BatteryTray
     // ---------------- 自定义设备 (devices.txt) ----------------
     class Candidate { public string VidPid, Name, Proto; public int Pct = -1; public bool Exists; }
     static Dictionary<string, string> customDevs = new Dictionary<string, string>();   // VID:PID -> 名称
+    static HashSet<string> ignoredDevs = new HashSet<string>();   // !VID:PID 已删除设备
     static DateTime customMtime;
     static readonly object customLock = new object();
     static string CustomPath()
@@ -396,10 +398,13 @@ class BatteryTray
             if (!File.Exists(f)) { lock (customLock) { customDevs = new Dictionary<string, string>(); customMtime = DateTime.MinValue; } return; }
             DateTime mt = File.GetLastWriteTimeUtc(f);
             var map = new Dictionary<string, string>();
+            var ign = new HashSet<string>();
             foreach (string raw in File.ReadAllLines(f, Encoding.UTF8))
             {
                 string line = raw.Trim();
                 if (line.Length == 0 || line.StartsWith("#")) continue;
+                bool isIgn = line.StartsWith("!");   // !VID:PID = 已删除设备
+                if (isIgn) line = line.Substring(1).Trim();
                 string head = line.Split(new[] { ' ', '\t' }, 2)[0].Trim().ToUpper();
                 int c = head.IndexOf(':');
                 if (c <= 0) continue;
@@ -410,16 +415,48 @@ class BatteryTray
                 int nameStart = line.ToUpper().IndexOf(head) + head.Length;
                 string name = nameStart < line.Length ? line.Substring(nameStart).Trim() : head;
                 if (name.Length == 0) name = head;
-                map[vid.ToString("X4") + ":" + pid.ToString("X4")] = name;
+                string key = vid.ToString("X4") + ":" + pid.ToString("X4");
+                if (isIgn) ign.Add(key); else map[key] = name;
             }
             lock (customLock)
             {
                 if (mt == customMtime) return;   // 已是最新
-                customDevs = map; customMtime = mt;
+                customDevs = map; ignoredDevs = ign; customMtime = mt;
             }
         }
         catch { }
     }
+    static bool IsIgnored(string key)
+    {
+        lock (customLock) { return ignoredDevs.Contains(key); }
+    }
+    // 删除设备: VID:PID 形态持久化到 devices.txt(!行), 其它键(如蓝牙实例路径)仅本次会话隐藏
+    static bool IgnoreDevice(string key)
+    {
+        lock (customLock)
+        {
+            try
+            {
+                ignoredDevs.Add(key);
+                customDevs.Remove(key);
+                if (key.Length == 9 && key[4] == ':') { WriteConfigLocked(); return true; }
+            }
+            catch { }
+        }
+        return false;
+    }
+    static void WriteConfigLocked()
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("# BatteryTray 设备列表");
+        sb.AppendLine("# 每行: VID:PID 名称 (十六进制); 也可手动编辑, 下轮轮询自动生效");
+        sb.AppendLine("# !VID:PID = 已删除(不再显示); 删掉该行即可恢复");
+        foreach (var kv in customDevs) sb.AppendLine(kv.Key + " " + kv.Value);
+        foreach (var ig in ignoredDevs) sb.AppendLine("!" + ig);
+        File.WriteAllText(CustomPath(), sb.ToString(), Encoding.UTF8);
+        customMtime = File.GetLastWriteTimeUtc(CustomPath());
+    }
+
     static string CustomName(string key)
     {
         lock (customLock) { return customDevs.ContainsKey(key) ? customDevs[key] : null; }
@@ -431,12 +468,8 @@ class BatteryTray
             try
             {
                 customDevs[vidPid] = name;
-                var sb = new StringBuilder();
-                sb.AppendLine("# BatteryTray 设备列表");
-                sb.AppendLine("# 每行: VID:PID 名称 (十六进制); 也可手动编辑, 下轮轮询自动生效");
-                foreach (var kv in customDevs) sb.AppendLine(kv.Key + " " + kv.Value);
-                File.WriteAllText(CustomPath(), sb.ToString(), Encoding.UTF8);
-                customMtime = File.GetLastWriteTimeUtc(CustomPath());
+                ignoredDevs.Remove(vidPid);   // 重新添加 = 取消忽略
+                WriteConfigLocked();
             }
             catch { }
         }
@@ -449,12 +482,7 @@ class BatteryTray
             {
                 if (!customDevs.ContainsKey(vidPid)) return;
                 customDevs.Remove(vidPid);
-                var sb = new StringBuilder();
-                sb.AppendLine("# BatteryTray 设备列表");
-                sb.AppendLine("# 每行: VID:PID 名称 (十六进制); 可手动编辑, 下轮轮询自动生效");
-                foreach (var kv in customDevs) sb.AppendLine(kv.Key + " " + kv.Value);
-                File.WriteAllText(CustomPath(), sb.ToString(), Encoding.UTF8);
-                customMtime = File.GetLastWriteTimeUtc(CustomPath());
+                WriteConfigLocked();
             }
             catch { }
         }
@@ -478,6 +506,7 @@ class BatteryTray
             if (d.UsagePage == 0xFF02 && d.OutLen > 0) tries.Add("N52");
             if (d.InLen > 0 && d.OutLen > 0) tries.Add("G87");
             if (d.FeatLen >= 20) tries.Add("A7");
+            if (d.FeatLen == 520) tries.Add("G98");
             if (tries.Count == 0 && d.OutLen > 0 && d.InLen > 0) tries.Add("N52");
             if (tries.Count == 0) continue;
             string custom = CustomName(d.Key);
@@ -493,6 +522,7 @@ class BatteryTray
                     if (pr == "A7") r = TryA7(h, d.FeatLen);
                     else if (pr == "G87") r = TryG87(h, d.InLen, d.OutLen);
                     else if (pr == "N52") r = TryN52(h, d.InLen, d.OutLen);
+                    else if (pr == "G98") r = TryG98(h);
                     else r = TryN54(h, d.InLen, d.OutLen);
                     if (r.Ok)
                     {
@@ -506,6 +536,17 @@ class BatteryTray
             CloseHandle(h);
         }
         return cands;
+    }
+
+    // 迈从 G98 V2 (有线): FF02 feature 520B RID 0x09, Set[09 87 00 00 01 00 02 00] 后 Get → [8]=电量, [9]高nibble=充电
+    static ProbeResult TryG98(IntPtr h)
+    {
+        byte[] cmd = new byte[520]; cmd[0] = 0x09; cmd[1] = 0x87; cmd[4] = 0x01; cmd[6] = 0x02;
+        if (!HidD_SetFeature(h, cmd, cmd.Length)) return ProbeResult.Fail;
+        byte[] rsp = new byte[520]; rsp[0] = 0x09;
+        if (!HidD_GetFeature(h, rsp, rsp.Length)) return ProbeResult.Fail;
+        if (rsp[1] != 0x87 || rsp[8] > 100 || rsp[8] == 0) return ProbeResult.Fail;
+        return ProbeResult.Good(rsp[8], (rsp[9] >> 4) & 0x0F);
     }
 
     // ---------------- 一轮探测 ----------------
@@ -522,6 +563,7 @@ class BatteryTray
             string model = ModelName(d.Vid, d.Pid);
             bool knownVid = KnownVid(d.Vid);
             string custom = CustomName(d.Key);
+            if (IsIgnored(d.Key)) continue;   // 用户已删除的设备
             if (!knownVid && model == null && custom == null) continue;
             if (done.Contains(d.Key)) continue;
             bool isRealtek = (d.Manufacturer ?? "").ToLower().Contains("realtek");
@@ -530,10 +572,12 @@ class BatteryTray
             if (d.Vid == 0x41E4 && d.UsagePage == 0xFF02 && d.Usage == 0x0002 && d.InLen > 0 && d.OutLen > 0) protos.Add("G87");
             if ((d.Vid == 0x373B || d.Vid == 0x3554 || d.Vid == 0x260D || d.Vid == 0x33E4) && d.UsagePage == 0xFF02 && d.OutLen > 0) protos.Add("N52");
             if (d.UsagePage == 0xFF05 && d.OutLen >= 64) protos.Add("N54");
+            if (d.Vid == 0x41E4 && d.UsagePage == 0xFF02 && d.FeatLen == 520) protos.Add("G98"); // 迈从G98 V2有线: 纯feature接口
             if (protos.Count == 0 && (knownVid || custom != null)) { // 未知PID兜底(白名单+devices.txt自定义设备)
                 if (d.OutLen > 0) protos.Add("N52");
                 if (d.InLen > 0 && d.OutLen > 0) protos.Add("G87");
                 if (d.FeatLen >= 20) protos.Add("A7");
+                if (d.FeatLen == 520) protos.Add("G98");
             }
             if (protos.Count == 0) continue;
             present.Add(d.Key);   // 设备仍枚举得到: 探测失败只算休眠, 不移除
@@ -547,6 +591,7 @@ class BatteryTray
                     if (pr == "A7") r = TryA7(h, d.FeatLen);
                     else if (pr == "G87") r = TryG87(h, d.InLen, d.OutLen);
                     else if (pr == "N52") r = TryN52(h, d.InLen, d.OutLen);
+                    else if (pr == "G98") r = TryG98(h);
                     else r = TryN54(h, d.InLen, d.OutLen);
                     if (r.Ok)
                     {
@@ -558,7 +603,7 @@ class BatteryTray
                             Name = dispName,
                             Short = shortNm,
                             Detail = (d.Product ?? "").Trim(),
-                            Mode = IsWiredPid(d.Vid, d.Pid) ? "有线" : "2.4G",
+                            Mode = IsWiredPid(d.Vid, d.Pid) || (d.Vid == 0x41E4 && d.Pid == 0x2203) ? "有线" : "2.4G",
                             Pct = r.Pct, Charging = r.Charging, Fresh = true, LastOk = DateTime.Now
                         });
                         // 未知厂商的新设备读到电量 → 自动记住, 下次免白名单
@@ -673,6 +718,7 @@ class BatteryTray
             info = new InfoForm();
             info.OnAdd = ShowAddDevice;
             info.OnChanged = TriggerRefresh;
+            info.OnDelete = DeleteDevice;
             pollTimer.Start();
             TriggerRefresh();
         }
@@ -777,6 +823,20 @@ class BatteryTray
                 if (r.Pct > LOW_PCT + 5 || r.Charging == 1) r.LowNotified = false;
             }
             if (info.Visible) info.Rebuild(rs);
+        }
+
+        void DeleteDevice(string key)
+        {
+            string nm = key;
+            lock (gate)
+            {
+                Reading rr;
+                if (state.TryGetValue(key, out rr)) nm = rr.Name;
+                state.Remove(key); lastPct.Remove(key); lastFresh.Remove(key);
+            }
+            bool persisted = IgnoreDevice(key);
+            Log.W("删除设备 " + nm + (persisted ? " (已写入忽略列表)" : " (仅本次会话)"));
+            UpdateUi();
         }
 
         void ShowInfo()
@@ -900,6 +960,7 @@ class BatteryTray
         public DateTime LastAutoHide = DateTime.MinValue;
         public Action OnAdd;      // 右上角"添加设备"
         public Action OnChanged;  // 重命名后触发刷新
+        public Action<string> OnDelete; // 行内✕删除设备
         public InfoForm()
         {
             FormBorderStyle = FormBorderStyle.None;
@@ -909,7 +970,7 @@ class BatteryTray
             BackColor = Color.FromArgb(32, 32, 32);
             ForeColor = Color.White;
             Font = new Font("Microsoft YaHei UI", 9f);
-            Width = 330;
+            Width = 352;
             Deactivate += (s, e) => { LastAutoHide = DateTime.Now; Hide(); };
         }
         protected override CreateParams CreateParams
@@ -968,6 +1029,14 @@ class BatteryTray
                     }
                 };
                 Controls.Add(rn);
+                var del = new Button { Text = "✕", Bounds = new Rectangle(324, y - 2, 20, 20), FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(45, 45, 45), ForeColor = Color.FromArgb(230, 120, 120), Font = new Font("Segoe UI", 8f), TabStop = false };
+                del.FlatAppearance.BorderSize = 0;
+                string dKey = r.Key, dName = r.Name;
+                del.Click += (s2, e2) =>
+                {
+                    if (MessageBox.Show(this, "不再显示「" + dName + "」的电量?\n\n删除后可用「＋ 添加」向导重新扫描恢复。", "删除设备", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes && OnDelete != null) OnDelete(dKey);
+                };
+                Controls.Add(del);
                 y += 22;
                 string det = r.Detail != null ? (r.Detail.Length > 24 ? r.Detail.Substring(0, 24) : r.Detail) : "";
                 Controls.Add(new Label { Text = (det.Length > 0 ? det + " · " : "") + r.Mode + " · " + status + " · " + r.LastOk.ToString("HH:mm:ss"), Location = new Point(14, y), AutoSize = true, ForeColor = Color.FromArgb(150, 150, 150), Font = new Font("Microsoft YaHei UI", 7.5f) });
@@ -1192,7 +1261,7 @@ class BatteryTray
         var mutex = new Mutex(true, "BatteryTray_SingleInstance_MchoseAtk", out created);
         if (!created) { MessageBox.Show("BatteryTray 已在运行中。", "外设电量", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
         Log.Init();
-        Log.W("启动 v1.1 (管理员, pid=" + System.Diagnostics.Process.GetCurrentProcess().Id + ")");
+        Log.W("启动 v1.3 (管理员, pid=" + System.Diagnostics.Process.GetCurrentProcess().Id + ")");
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new TrayApp());
