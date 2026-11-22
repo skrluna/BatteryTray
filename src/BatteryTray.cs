@@ -15,7 +15,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("BatteryTray")]
-[assembly: System.Reflection.AssemblyVersion("1.3.2.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.3.0")]
 
 class BatteryTray
 {
@@ -997,8 +997,6 @@ class BatteryTray
     {
         public DateTime LastAutoHide = DateTime.MinValue;
         DateTime shownAt = DateTime.MinValue;
-        System.Windows.Forms.Timer outsideTimer;
-        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
         public Action OnAdd;      // 右上角"添加设备"
         public Action OnChanged;  // 重命名后触发刷新
         public Action<string> OnDelete; // 行内✕删除设备
@@ -1012,30 +1010,92 @@ class BatteryTray
             ForeColor = Color.White;
             Font = new Font("Microsoft YaHei UI", 9f);
             Width = 352;
-            // 面板不抢焦点(WS_EX_NOACTIVATE), 因此不靠 Deactivate 收起, 改为监听面板外点击
-            outsideTimer = new System.Windows.Forms.Timer();
-            outsideTimer.Interval = 120;
-            outsideTimer.Tick += (s, e) => CheckOutsideClick();
+            // 面板不抢焦点(WS_EX_NOACTIVATE), 收起时机由全局低级钩子决定(见 InstallHooks)
         }
         protected override bool ShowWithoutActivation { get { return true; } }
         protected override void OnShown(EventArgs e)
         {
             shownAt = DateTime.Now;
-            if (outsideTimer != null) outsideTimer.Start();
+            InstallHooks();
             base.OnShown(e);
         }
         protected override void OnVisibleChanged(EventArgs e)
         {
-            if (!Visible && outsideTimer != null) outsideTimer.Stop();
+            if (!Visible) RemoveHooks();
             base.OnVisibleChanged(e);
         }
-        // 面板不激活, 所以自己检测"点了面板外面"来收起
-        void CheckOutsideClick()
+        protected override void OnHandleDestroyed(EventArgs e) { RemoveHooks(); base.OnHandleDestroyed(e); }
+
+        // ---------------- 收起逻辑: 行业通用做法(全局低级钩子) ----------------
+        // 系统菜单/开始菜单浮层/PowerToys 等托盘弹层的统一做法: 面板可见期间挂 WH_MOUSE_LL,
+        // 事件驱动地感知"任何窗口上的每一次按下", 落在面板外就收起(不吞点击, 下层窗口照常收到)。
+        // v1.3.2 用 120ms 轮询 GetAsyncKeyState, 快速点击会被整段错过 → 表现为"很难关掉"。
+        // 同时挂 WH_KEYBOARD_LL 支持 Esc 收起(与菜单行为一致)。
+        delegate IntPtr HookProc(int nCode, IntPtr wp, IntPtr lp);
+        const int WH_MOUSE_LL = 14, WH_KEYBOARD_LL = 13;
+        const int WM_LBUTTONDOWN = 0x0201, WM_RBUTTONDOWN = 0x0204, WM_KEYDOWN = 0x0100;
+        const uint LLMHF_INJECTED = 0x1, LLKHF_INJECTED = 0x10, VK_ESCAPE = 0x1B;
+        IntPtr mouseHook, kbHook;
+        HookProc mouseProc, kbProc;   // 持有委托引用, 防止被 GC 后钩子失效
+        [StructLayout(LayoutKind.Sequential)] struct HOOKPOINT { public int X, Y; }
+        [StructLayout(LayoutKind.Sequential)] struct MSLLHOOKSTRUCT { public HOOKPOINT pt; public uint mouseData, flags, time; public IntPtr extraInfo; }
+        [StructLayout(LayoutKind.Sequential)] struct KBDLLHOOKSTRUCT { public uint vkCode, scanCode, flags, time; public IntPtr extraInfo; }
+        [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+        [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
+        [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wp, IntPtr lp);
+        void InstallHooks()
         {
-            if ((DateTime.Now - shownAt).TotalMilliseconds < 300) return;   // 忽略打开面板那一下
-            bool down = (GetAsyncKeyState(0x01) & 0x8000) != 0 || (GetAsyncKeyState(0x02) & 0x8000) != 0;
-            if (!down) return;
-            if (!Bounds.Contains(Cursor.Position)) { LastAutoHide = DateTime.Now; Hide(); }
+            try
+            {
+                if (mouseHook == IntPtr.Zero)
+                {
+                    mouseProc = MouseHookProc;
+                    mouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouseProc, IntPtr.Zero, 0);
+                    if (mouseHook == IntPtr.Zero) Log.W("鼠标钩子安装失败 err=" + Marshal.GetLastWin32Error());
+                }
+                if (kbHook == IntPtr.Zero)
+                {
+                    kbProc = KbHookProc;
+                    kbHook = SetWindowsHookEx(WH_KEYBOARD_LL, kbProc, IntPtr.Zero, 0);
+                    if (kbHook == IntPtr.Zero) Log.W("键盘钩子安装失败 err=" + Marshal.GetLastWin32Error());
+                }
+            }
+            catch (Exception ex) { Log.W("钩子安装异常: " + ex.Message); }
+        }
+        void RemoveHooks()
+        {
+            if (mouseHook != IntPtr.Zero) { UnhookWindowsHookEx(mouseHook); mouseHook = IntPtr.Zero; }
+            if (kbHook != IntPtr.Zero) { UnhookWindowsHookEx(kbHook); kbHook = IntPtr.Zero; }
+        }
+        IntPtr MouseHookProc(int nCode, IntPtr wp, IntPtr lp)
+        {
+            int msg = wp.ToInt32();
+            if (nCode >= 0 && Visible && (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN))
+            {
+                var m = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lp, typeof(MSLLHOOKSTRUCT));
+                if ((m.flags & LLMHF_INJECTED) == 0   // 忽略程序合成的点击, 只认物理输入
+                    && (DateTime.Now - shownAt).TotalMilliseconds >= 200
+                    && !Bounds.Contains(new Point(m.pt.X, m.pt.Y)))
+                {
+                    // 记 LastAutoHide: 若这次点的是托盘图标本身, 350ms 防抖会把它当"收起"而不是"再打开"
+                    LastAutoHide = DateTime.Now;
+                    Hide();
+                }
+            }
+            return CallNextHookEx(mouseHook, nCode, wp, lp);
+        }
+        IntPtr KbHookProc(int nCode, IntPtr wp, IntPtr lp)
+        {
+            if (nCode >= 0 && Visible && wp.ToInt32() == WM_KEYDOWN)
+            {
+                var k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lp, typeof(KBDLLHOOKSTRUCT));
+                if ((k.flags & LLKHF_INJECTED) == 0 && k.vkCode == VK_ESCAPE)
+                {
+                    LastAutoHide = DateTime.Now;
+                    Hide();
+                }
+            }
+            return CallNextHookEx(kbHook, nCode, wp, lp);
         }
         protected override CreateParams CreateParams
         {
@@ -1326,7 +1386,7 @@ class BatteryTray
         var mutex = new Mutex(true, "BatteryTray_SingleInstance_MchoseAtk", out created);
         if (!created) { MessageBox.Show("BatteryTray 已在运行中。", "外设电量", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
         Log.Init();
-        Log.W("启动 v1.3.2 (管理员, pid=" + System.Diagnostics.Process.GetCurrentProcess().Id + ")");
+        Log.W("启动 v1.3.3 (管理员, pid=" + System.Diagnostics.Process.GetCurrentProcess().Id + ")");
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new TrayApp());

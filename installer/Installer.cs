@@ -13,7 +13,7 @@ class InstallerApp : Form
 
     InstallerApp()
     {
-        Text = "外设电量托盘 v1.3.2 安装程序";
+        Text = "外设电量托盘 v1.3.3 安装程序";
         FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen; ClientSize = new Size(480, 300);
         var l1 = new Label(); l1.Text = "安装到："; l1.Location = new Point(14, 16); l1.AutoSize = true; Controls.Add(l1);
@@ -100,7 +100,7 @@ class InstallerApp : Form
             using (var k = Microsoft.Win32.Registry.LocalMachine.CreateSubKey(@"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\BatteryTray"))
             {
                 k.SetValue("DisplayName", "外设电量托盘 BatteryTray");
-                k.SetValue("DisplayVersion", "1.3.2");
+                k.SetValue("DisplayVersion", "1.3.3");
                 k.SetValue("Publisher", "skrluna");
                 k.SetValue("DisplayIcon", exe);
                 k.SetValue("UninstallString", un);
