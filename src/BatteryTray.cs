@@ -15,7 +15,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("BatteryTray")]
-[assembly: System.Reflection.AssemblyVersion("1.3.1.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.2.0")]
 
 class BatteryTray
 {
@@ -32,6 +32,16 @@ class BatteryTray
                 string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "BatteryTray");
                 Directory.CreateDirectory(dir);
                 path = Path.Combine(dir, "tray.log");
+                // 旧日志可能是无 BOM 的 UTF-8, 转成带 BOM 以便记事本/PowerShell 正确显示中文
+                try
+                {
+                    if (File.Exists(path) && new FileInfo(path).Length > 0 && new FileInfo(path).Length < 256 * 1024)
+                    {
+                        string old = File.ReadAllText(path, Encoding.UTF8);
+                        File.WriteAllText(path, old, new UTF8Encoding(true));
+                    }
+                }
+                catch { }
             }
             catch { path = null; }
         }
@@ -43,8 +53,8 @@ class BatteryTray
                 lock (lk)
                 {
                     var fi = new FileInfo(path);
-                    if (fi.Exists && fi.Length > 256 * 1024) File.WriteAllText(path, "");
-                    File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + msg + Environment.NewLine);
+                    if (fi.Exists && fi.Length > 256 * 1024) File.Delete(path);
+                    File.AppendAllText(path, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  " + msg + Environment.NewLine, new UTF8Encoding(true));
                 }
             }
             catch { }
@@ -655,10 +665,15 @@ class BatteryTray
     class PumpForm : Form
     {
         public Action OnDeviceChange;
+        public Action OnTaskbarCreated;
         const int WM_DEVICECHANGE = 0x0219;
+        static readonly int TASKBAR_CREATED = RegisterWindowMessage("TaskbarCreated");
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int RegisterWindowMessage(string s);
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == WM_DEVICECHANGE && OnDeviceChange != null) OnDeviceChange();
+            // explorer 重启后会广播 TaskbarCreated; NotifyIcon 自己不会重新注册, 必须显式补一次
+            if (TASKBAR_CREATED != 0 && m.Msg == TASKBAR_CREATED && OnTaskbarCreated != null) OnTaskbarCreated();
             base.WndProc(ref m);
         }
     }
@@ -685,6 +700,7 @@ class BatteryTray
             pump.FormBorderStyle = FormBorderStyle.FixedToolWindow;
             pump.Opacity = 0;
             pump.OnDeviceChange = () => { debounceTimer.Stop(); debounceTimer.Start(); };
+            pump.OnTaskbarCreated = () => { Log.W("TaskbarCreated: 重新注册托盘图标"); ReRegisterTray(); };
             var h = pump.Handle; // 强制创建窗口以接收消息
 
             pollTimer = new System.Windows.Forms.Timer(); pollTimer.Interval = POLL_MS;
@@ -708,9 +724,11 @@ class BatteryTray
             tray.Visible = true;
             tray.MouseClick += (s, e) =>
             {
+                string autoHide = info.LastAutoHide == DateTime.MinValue ? "none" : ((int)(DateTime.Now - info.LastAutoHide).TotalMilliseconds) + "ms";
+                Log.W("托盘点击 " + e.Button + " info.Visible=" + info.Visible + " 上次自动收起=" + autoHide);
                 if (e.Button != MouseButtons.Left) return;
                 if (info.Visible) { info.Hide(); return; }
-                // 刚因点击面板外被 Deactivate 收起 → 本次点击视为"收起", 不再重开
+                // 刚因点击面板外被收起 → 本次点击视为"收起", 不再重开
                 if ((DateTime.Now - info.LastAutoHide).TotalMilliseconds < 350) return;
                 ShowInfo();
             };
@@ -721,6 +739,21 @@ class BatteryTray
             info.OnDelete = DeleteDevice;
             pollTimer.Start();
             TriggerRefresh();
+        }
+
+        // explorer 重启后补注册: 先撤再挂, 然后立刻刷新文本/图标
+        void ReRegisterTray()
+        {
+            try
+            {
+                tray.Visible = false;
+                if (lastIcon == null) lastIcon = MakeIcon(-1, false, false);
+                tray.Icon = lastIcon;
+                tray.Visible = true;
+                Log.W("托盘图标已重新注册 visible=" + tray.Visible);
+                UpdateUi();
+            }
+            catch (Exception ex) { Log.W("重新注册托盘失败: " + ex.Message); }
         }
 
         void ExitApp()
@@ -842,13 +875,17 @@ class BatteryTray
 
         void ShowInfo()
         {
-            List<Reading> rs;
-            lock (gate) { rs = new List<Reading>(state.Values); }
-            info.Rebuild(rs);
-            var wa = Screen.PrimaryScreen.WorkingArea;
-            info.Location = new Point(wa.Right - info.Width - 12, wa.Bottom - info.Height - 12);
-            info.Show();
-            ForceForeground(info);
+            try
+            {
+                List<Reading> rs;
+                lock (gate) { rs = new List<Reading>(state.Values); }
+                info.Rebuild(rs);
+                var wa = Screen.PrimaryScreen.WorkingArea;
+                info.Location = new Point(wa.Right - info.Width - 12, wa.Bottom - info.Height - 12);
+                info.Show();   // NOACTIVATE 面板, 不抢前台焦点, 前台有全屏游戏也不会被 Win11 拒绝
+                Log.W("面板显示 " + rs.Count + " 台设备 loc=" + info.Location + " visible=" + info.Visible);
+            }
+            catch (Exception ex) { Log.W("面板显示失败: " + ex.Message); }
         }
 
         [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
@@ -959,6 +996,9 @@ class BatteryTray
     class InfoForm : Form
     {
         public DateTime LastAutoHide = DateTime.MinValue;
+        DateTime shownAt = DateTime.MinValue;
+        System.Windows.Forms.Timer outsideTimer;
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
         public Action OnAdd;      // 右上角"添加设备"
         public Action OnChanged;  // 重命名后触发刷新
         public Action<string> OnDelete; // 行内✕删除设备
@@ -972,7 +1012,30 @@ class BatteryTray
             ForeColor = Color.White;
             Font = new Font("Microsoft YaHei UI", 9f);
             Width = 352;
-            Deactivate += (s, e) => { LastAutoHide = DateTime.Now; Hide(); };
+            // 面板不抢焦点(WS_EX_NOACTIVATE), 因此不靠 Deactivate 收起, 改为监听面板外点击
+            outsideTimer = new System.Windows.Forms.Timer();
+            outsideTimer.Interval = 120;
+            outsideTimer.Tick += (s, e) => CheckOutsideClick();
+        }
+        protected override bool ShowWithoutActivation { get { return true; } }
+        protected override void OnShown(EventArgs e)
+        {
+            shownAt = DateTime.Now;
+            if (outsideTimer != null) outsideTimer.Start();
+            base.OnShown(e);
+        }
+        protected override void OnVisibleChanged(EventArgs e)
+        {
+            if (!Visible && outsideTimer != null) outsideTimer.Stop();
+            base.OnVisibleChanged(e);
+        }
+        // 面板不激活, 所以自己检测"点了面板外面"来收起
+        void CheckOutsideClick()
+        {
+            if ((DateTime.Now - shownAt).TotalMilliseconds < 300) return;   // 忽略打开面板那一下
+            bool down = (GetAsyncKeyState(0x01) & 0x8000) != 0 || (GetAsyncKeyState(0x02) & 0x8000) != 0;
+            if (!down) return;
+            if (!Bounds.Contains(Cursor.Position)) { LastAutoHide = DateTime.Now; Hide(); }
         }
         protected override CreateParams CreateParams
         {
@@ -980,6 +1043,7 @@ class BatteryTray
             {
                 var cp = base.CreateParams;
                 cp.ExStyle |= 0x00000080;   // WS_EX_TOOLWINDOW: 不进 Alt-Tab
+                cp.ExStyle |= 0x08000000;   // WS_EX_NOACTIVATE: 显示时不抢前台, 避免被系统拒绝激活后瞬间收起
                 return cp;
             }
         }
@@ -1262,7 +1326,7 @@ class BatteryTray
         var mutex = new Mutex(true, "BatteryTray_SingleInstance_MchoseAtk", out created);
         if (!created) { MessageBox.Show("BatteryTray 已在运行中。", "外设电量", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
         Log.Init();
-        Log.W("启动 v1.3.1 (管理员, pid=" + System.Diagnostics.Process.GetCurrentProcess().Id + ")");
+        Log.W("启动 v1.3.2 (管理员, pid=" + System.Diagnostics.Process.GetCurrentProcess().Id + ")");
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new TrayApp());
