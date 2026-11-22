@@ -15,7 +15,7 @@ using System.Windows.Forms;
 using Microsoft.Win32;
 
 [assembly: System.Reflection.AssemblyTitle("BatteryTray")]
-[assembly: System.Reflection.AssemblyVersion("1.3.3.0")]
+[assembly: System.Reflection.AssemblyVersion("1.3.4.0")]
 
 class BatteryTray
 {
@@ -737,6 +737,7 @@ class BatteryTray
             info.OnAdd = ShowAddDevice;
             info.OnChanged = TriggerRefresh;
             info.OnDelete = DeleteDevice;
+            info.OnHidden = HideShield;
             pollTimer.Start();
             TriggerRefresh();
         }
@@ -883,9 +884,40 @@ class BatteryTray
                 var wa = Screen.PrimaryScreen.WorkingArea;
                 info.Location = new Point(wa.Right - info.Width - 12, wa.Bottom - info.Height - 12);
                 info.Show();   // NOACTIVATE 面板, 不抢前台焦点, 前台有全屏游戏也不会被 Win11 拒绝
+                ShowShield();  // 全屏透明护盾铺底: 面板外的任何点击都会先落在盾上 → 收起面板
                 Log.W("面板显示 " + rs.Count + " 台设备 loc=" + info.Location + " visible=" + info.Visible);
             }
             catch (Exception ex) { Log.W("面板显示失败: " + ex.Message); }
+        }
+
+        // ---------------- 全屏透明护盾(v1.3.4, 模态菜单/浮层的"灯箱"做法) ----------------
+        // v1.3.3 的 WH_MOUSE_LL 在本机装钩成功但回调从不抵达(疑似安全软件静默拦截), 点外面收不起来。
+        // 护盾原理: 面板显示期间铺一层不可见但可命中的全屏窗口(在面板之下), 面板外的物理点击必然
+        // 先落在盾上 → 收起面板并原位转发这次点击; 面板/对话框(均 TopMost)在盾之上不受影响。
+        ShieldForm shield;
+        const uint MOUSEEVENTF_LEFTDOWN = 0x02, MOUSEEVENTF_LEFTUP = 0x04;
+        [DllImport("user32.dll")] static extern void mouse_event(uint f, int dx, int dy, uint d, IntPtr e);
+        void ShowShield()
+        {
+            if (shield == null || shield.IsDisposed) shield = new ShieldForm();
+            shield.OnOutside = ShieldClicked;
+            shield.Bounds = SystemInformation.VirtualScreen;   // 每次显示前重设, 兼容分辨率/多屏变化
+            shield.Show();
+            info.BringToFront();   // 保证面板在盾之上
+            Log.W("护盾铺开 " + shield.Bounds);
+        }
+        void HideShield()
+        {
+            if (shield != null && shield.Visible) { shield.Hide(); Log.W("护盾收起"); }
+        }
+        void ShieldClicked()
+        {
+            var p = Cursor.Position;
+            info.LastAutoHide = DateTime.Now;   // 转发的点击若落在托盘图标上, 350ms 防抖会把它当"收起"而不是"再打开"
+            info.Hide();                        // 触发 OnHidden → HideShield
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, IntPtr.Zero);   // 光标未动, 原位补发单击
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, IntPtr.Zero);
+            Log.W("护盾命中 " + p + " → 收起并转发点击");
         }
 
         [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
@@ -1010,92 +1042,92 @@ class BatteryTray
             ForeColor = Color.White;
             Font = new Font("Microsoft YaHei UI", 9f);
             Width = 352;
-            // 面板不抢焦点(WS_EX_NOACTIVATE), 收起时机由全局低级钩子决定(见 InstallHooks)
+            // 面板不抢焦点(WS_EX_NOACTIVATE): 点面板外由护盾窗口收起(TrayApp.ShieldForm), Esc 由钩子+轮询兜底
+            escTimer = new System.Windows.Forms.Timer();
+            escTimer.Interval = 60;
+            escTimer.Tick += (s, e) => CheckEsc();
         }
         protected override bool ShowWithoutActivation { get { return true; } }
         protected override void OnShown(EventArgs e)
         {
             shownAt = DateTime.Now;
             InstallHooks();
+            escTimer.Start();
             base.OnShown(e);
         }
         protected override void OnVisibleChanged(EventArgs e)
         {
-            if (!Visible) RemoveHooks();
+            if (!Visible)
+            {
+                escTimer.Stop();
+                RemoveHooks();
+                if (OnHidden != null) OnHidden();   // 通知 TrayApp 收起护盾
+            }
             base.OnVisibleChanged(e);
         }
         protected override void OnHandleDestroyed(EventArgs e) { RemoveHooks(); base.OnHandleDestroyed(e); }
+        public Action OnHidden;   // 面板收起时回调(TrayApp 用它收起护盾)
 
-        // ---------------- 收起逻辑: 行业通用做法(全局低级钩子) ----------------
-        // 系统菜单/开始菜单浮层/PowerToys 等托盘弹层的统一做法: 面板可见期间挂 WH_MOUSE_LL,
-        // 事件驱动地感知"任何窗口上的每一次按下", 落在面板外就收起(不吞点击, 下层窗口照常收到)。
-        // v1.3.2 用 120ms 轮询 GetAsyncKeyState, 快速点击会被整段错过 → 表现为"很难关掉"。
-        // 同时挂 WH_KEYBOARD_LL 支持 Esc 收起(与菜单行为一致)。
+        // ---------------- 收起逻辑(v1.3.4 模态护盾/灯箱方案) ----------------
+        // v1.3.3 实测: WH_MOUSE_LL 安装成功但回调从不抵达(疑似安全软件静默拦截 LL 钩子), 点外面收不起来。
+        // 改用系统模态菜单/浮层的另一通用做法——"模态盾": 面板显示期间铺一层全屏透明护盾窗口,
+        // 面板外的任何点击必然先落在盾上 → 收起面板, 并原位转发这次点击(见 TrayApp.ShieldClicked)。
+        // Esc: WH_KEYBOARD_LL(带前3次回调日志确诊是否被拦) + GetAsyncKeyState 60ms 轮询双保险。
+        System.Windows.Forms.Timer escTimer;
+        int kbLog;   // 前3次键盘钩子回调记日志, 用于确诊回调是否被安全软件拦截
         delegate IntPtr HookProc(int nCode, IntPtr wp, IntPtr lp);
-        const int WH_MOUSE_LL = 14, WH_KEYBOARD_LL = 13;
-        const int WM_LBUTTONDOWN = 0x0201, WM_RBUTTONDOWN = 0x0204, WM_KEYDOWN = 0x0100;
-        const uint LLMHF_INJECTED = 0x1, LLKHF_INJECTED = 0x10, VK_ESCAPE = 0x1B;
-        IntPtr mouseHook, kbHook;
-        HookProc mouseProc, kbProc;   // 持有委托引用, 防止被 GC 后钩子失效
-        [StructLayout(LayoutKind.Sequential)] struct HOOKPOINT { public int X, Y; }
-        [StructLayout(LayoutKind.Sequential)] struct MSLLHOOKSTRUCT { public HOOKPOINT pt; public uint mouseData, flags, time; public IntPtr extraInfo; }
+        const int WH_KEYBOARD_LL = 13;
+        const int WM_KEYDOWN = 0x0100;
+        const uint LLKHF_INJECTED = 0x10, VK_ESCAPE = 0x1B;
+        IntPtr kbHook;
+        HookProc kbProc;   // 持有委托引用, 防止被 GC 后钩子失效
         [StructLayout(LayoutKind.Sequential)] struct KBDLLHOOKSTRUCT { public uint vkCode, scanCode, flags, time; public IntPtr extraInfo; }
         [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
         [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
         [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wp, IntPtr lp);
+        [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vk);
         void InstallHooks()
         {
             try
             {
-                if (mouseHook == IntPtr.Zero)
-                {
-                    mouseProc = MouseHookProc;
-                    mouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouseProc, IntPtr.Zero, 0);
-                    if (mouseHook == IntPtr.Zero) Log.W("鼠标钩子安装失败 err=" + Marshal.GetLastWin32Error());
-                }
                 if (kbHook == IntPtr.Zero)
                 {
                     kbProc = KbHookProc;
                     kbHook = SetWindowsHookEx(WH_KEYBOARD_LL, kbProc, IntPtr.Zero, 0);
                     if (kbHook == IntPtr.Zero) Log.W("键盘钩子安装失败 err=" + Marshal.GetLastWin32Error());
+                    else Log.W("键盘钩子已挂 h=" + kbHook.ToString());
                 }
             }
             catch (Exception ex) { Log.W("钩子安装异常: " + ex.Message); }
         }
         void RemoveHooks()
         {
-            if (mouseHook != IntPtr.Zero) { UnhookWindowsHookEx(mouseHook); mouseHook = IntPtr.Zero; }
             if (kbHook != IntPtr.Zero) { UnhookWindowsHookEx(kbHook); kbHook = IntPtr.Zero; }
-        }
-        IntPtr MouseHookProc(int nCode, IntPtr wp, IntPtr lp)
-        {
-            int msg = wp.ToInt32();
-            if (nCode >= 0 && Visible && (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN))
-            {
-                var m = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lp, typeof(MSLLHOOKSTRUCT));
-                if ((m.flags & LLMHF_INJECTED) == 0   // 忽略程序合成的点击, 只认物理输入
-                    && (DateTime.Now - shownAt).TotalMilliseconds >= 200
-                    && !Bounds.Contains(new Point(m.pt.X, m.pt.Y)))
-                {
-                    // 记 LastAutoHide: 若这次点的是托盘图标本身, 350ms 防抖会把它当"收起"而不是"再打开"
-                    LastAutoHide = DateTime.Now;
-                    Hide();
-                }
-            }
-            return CallNextHookEx(mouseHook, nCode, wp, lp);
         }
         IntPtr KbHookProc(int nCode, IntPtr wp, IntPtr lp)
         {
-            if (nCode >= 0 && Visible && wp.ToInt32() == WM_KEYDOWN)
+            if (nCode >= 0 && Visible)
             {
                 var k = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lp, typeof(KBDLLHOOKSTRUCT));
-                if ((k.flags & LLKHF_INJECTED) == 0 && k.vkCode == VK_ESCAPE)
+                if (kbLog < 3) { kbLog++; Log.W("键盘钩子回调 msg=0x" + wp.ToInt32().ToString("X") + " vk=0x" + k.vkCode.ToString("X")); }
+                if (wp.ToInt32() == WM_KEYDOWN && (k.flags & LLKHF_INJECTED) == 0 && k.vkCode == VK_ESCAPE)
                 {
                     LastAutoHide = DateTime.Now;
+                    Log.W("Esc 收起(钩子)");
                     Hide();
                 }
             }
             return CallNextHookEx(kbHook, nCode, wp, lp);
+        }
+        void CheckEsc()
+        {
+            short s = GetAsyncKeyState(0x1B);
+            if ((s & 0x8000) != 0 || (s & 0x0001) != 0)
+            {
+                LastAutoHide = DateTime.Now;
+                Log.W("Esc 收起(轮询)");
+                Hide();
+            }
         }
         protected override CreateParams CreateParams
         {
@@ -1340,6 +1372,38 @@ class BatteryTray
         }
     }
 
+    // 全屏透明点击护盾: 模态菜单/浮层的"灯箱"做法。不抢焦点、不可见但参与命中测试,
+    // 面板显示期间铺底, 面板外的任何点击(桌面/其他程序/任务栏)都会落在盾上 → 收起面板。
+    class ShieldForm : Form
+    {
+        public Action OnOutside;
+        public ShieldForm()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            StartPosition = FormStartPosition.Manual;
+            ShowInTaskbar = false;
+            TopMost = true;
+            BackColor = Color.Black;
+            Opacity = 0.01;   // 不可见, 但 alpha>0 的分层窗口仍参与命中测试
+        }
+        protected override bool ShowWithoutActivation { get { return true; } }
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.ExStyle |= 0x00000080;   // WS_EX_TOOLWINDOW: 不进 Alt-Tab
+                cp.ExStyle |= 0x08000000;   // WS_EX_NOACTIVATE: 不抢焦点
+                return cp;
+            }
+        }
+        protected override void OnMouseUp(MouseEventArgs e)
+        {
+            base.OnMouseUp(e);
+            if (OnOutside != null && (e.Button == MouseButtons.Left || e.Button == MouseButtons.Right)) OnOutside();
+        }
+    }
+
     class BarPanel : Control
     {
         public int Pct; public bool Fresh;
@@ -1386,7 +1450,7 @@ class BatteryTray
         var mutex = new Mutex(true, "BatteryTray_SingleInstance_MchoseAtk", out created);
         if (!created) { MessageBox.Show("BatteryTray 已在运行中。", "外设电量", MessageBoxButtons.OK, MessageBoxIcon.Information); return; }
         Log.Init();
-        Log.W("启动 v1.3.3 (管理员, pid=" + System.Diagnostics.Process.GetCurrentProcess().Id + ")");
+        Log.W("启动 v1.3.4 (管理员, pid=" + System.Diagnostics.Process.GetCurrentProcess().Id + ")");
         Application.EnableVisualStyles();
         Application.SetCompatibleTextRenderingDefault(false);
         Application.Run(new TrayApp());
